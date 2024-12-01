@@ -20,7 +20,7 @@ TEMP_CSV_FILE_PATH = "temp_hrv_results.csv"
 if not os.path.exists(CSV_FILE_PATH):
     with open(CSV_FILE_PATH, mode='w', newline='') as file:
         writer = csv.writer(file)
-        writer.writerow(["StartTimestamp", "EndTimestamp", "ErrorCount", "RRCount", "SDNN", "LF", "HF", "LF/HF", "SD1", "SD2"])
+        writer.writerow(["StartTimestamp", "EndTimestamp", "ErrorCount", "RRCount", "SDNN", "LF", "HF", "LF/HF", "SD1", "SD2", "HotellingT2", "SPE"])
 
 # Firebase에서 데이터 참조
 ref = db.reference('HeartRateData')
@@ -29,37 +29,68 @@ ref = db.reference('HeartRateData')
 rr_window = deque(maxlen=120)  # 최근 120초 데이터만 유지
 last_processed_timestamp = None
 
+def fetch_initial_rr_intervals():
+    """
+    Firebase에서 가장 최근 2분 데이터를 가져옵니다.
+    """
+    global last_processed_timestamp
+
+    query = ref.order_by_child("timestamp").limit_to_last(120)
+    data = query.get()
+
+    if not data:
+        print("No data found.")
+        return []
+
+    rr_data = []
+    for key, value in sorted(data.items(), key=lambda item: item[1]['timestamp']):
+        timestamp = value.get("timestamp")
+        rr_interval = value.get("rrInterval", 0)
+        is_error = value.get("isError", True)
+
+        # 에러 데이터도 포함하되, RR 간격은 0으로 설정
+        rr_data.append((timestamp, 0 if is_error else rr_interval))
+
+    if rr_data:
+        last_processed_timestamp = rr_data[-1][0]  # 가장 마지막 타임스탬프 업데이트
+
+    return rr_data
+
 
 def fetch_new_rr_intervals():
     """
-    Firebase에서 새로운 RR 데이터를 가져옵니다.
+    마지막 처리된 타임스탬프 이후의 데이터를 Firebase에서 가져옵니다.
     """
     global last_processed_timestamp
-    all_data = ref.get()  # Firebase에서 모든 데이터를 가져옵니다.
 
-    if not all_data:
-        print("No data found in Firebase.")
+    if not last_processed_timestamp:
+        print("Fetching initial data...")
+        return fetch_initial_rr_intervals()
+
+    query = ref.order_by_child("timestamp").start_at(last_processed_timestamp)
+    data = query.get()
+
+    if not data:
+        print("No new data found.")
         return []
 
-    new_data = []
-    for key, value in all_data.items():
+    rr_data = []
+    for key, value in sorted(data.items(), key=lambda item: item[1]['timestamp']):
         timestamp = value.get("timestamp")
         rr_interval = value.get("rrInterval", 0)
-        is_error = value.get("isError", True)  # 기본값 True로 설정해 에러로 처리
+        is_error = value.get("isError", True)
         
-        # 이미 처리된 데이터는 제외
-        if last_processed_timestamp is None or timestamp > last_processed_timestamp:
-            # 에러 데이터도 포함하되, rr_interval=0으로 처리
-            if is_error or rr_interval <= 0:
-                new_data.append((timestamp, 0))  # 에러 데이터는 rr_interval=0
-            else:
-                new_data.append((timestamp, rr_interval))
+        # 동일한 timestamp 데이터는 제외
+        if timestamp == last_processed_timestamp:
+            continue
 
+        # 에러 데이터도 포함하되, RR 간격은 0으로 설정
+        rr_data.append((timestamp, 0 if is_error else rr_interval))
 
-    # 새로운 데이터를 타임스탬프 기준으로 정렬
-    new_data.sort(key=lambda x: x[0])
+    if rr_data:
+        last_processed_timestamp = rr_data[-1][0]  # 가장 마지막 타임스탬프 업데이트
 
-    return new_data
+    return rr_data
 
 
 def calculate_time_domain_hrv(rr_intervals):
@@ -94,6 +125,25 @@ def calculate_nonlinear_domain_hrv(rr_intervals):
     sd2 = np.sqrt(2 * np.std(rr_intervals, ddof=1)**2 - sd1**2)
     return {"SD1": sd1, "SD2": sd2}
 
+def calculate_hotelling_t2_spe(hrv_data):
+    """
+    Hotelling T² 및 SPE 값을 계산합니다.
+    """
+    try:
+        hrv_values = np.array([v for v in hrv_data.values() if v is not None])
+        if len(hrv_values) == 0:
+            return {"HotellingT2": None, "SPE": None}
+        
+        mean = np.mean(hrv_values)
+        cov_matrix = np.cov(hrv_values)
+        t2_stat = np.dot(hrv_values - mean, np.linalg.inv(cov_matrix)).dot(hrv_values - mean)
+        spe = np.sum((hrv_values - mean)**2)
+        
+        return {"HotellingT2": t2_stat, "SPE": spe}
+    except Exception as e:
+        print(f"Error calculating Hotelling T² and SPE: {e}")
+        return {"HotellingT2": None, "SPE": None}
+
 def write_to_csv(start_timestamp, end_timestamp, error_count, rr_count, hrv_data):
     # 기존 파일에서 데이터를 읽어와 임시 파일에 복사
     with open(TEMP_CSV_FILE_PATH, mode='w', newline='') as temp_file:
@@ -117,7 +167,9 @@ def write_to_csv(start_timestamp, end_timestamp, error_count, rr_count, hrv_data
             hrv_data.get("HF"),
             hrv_data.get("LF/HF"),
             hrv_data.get("SD1"),
-            hrv_data.get("SD2")
+            hrv_data.get("SD2"),
+            hrv_data.get("HotellingT2"),
+            hrv_data.get("SPE")
         ])
     
     # 기존 CSV 파일 삭제 후 임시 파일을 새 파일로 이동
@@ -129,51 +181,47 @@ def process_hrv():
     """
     새로운 데이터를 가져와 슬라이딩 윈도우 방식으로 HRV를 계산합니다.
     """
-    global last_processed_timestamp
+    global rr_window
+
+    # 초기 데이터 로드
+    if not rr_window:
+        rr_window.extend(fetch_initial_rr_intervals())
+
+    # 새로운 데이터 가져오기
     new_rr_data = fetch_new_rr_intervals()
 
     if not new_rr_data:
         print("No new data to process.")
         return
 
+    # 새로운 데이터 추가 및 슬라이딩 윈도우 유지
     for timestamp, rr_interval in new_rr_data:
-        rr_window.append((timestamp, rr_interval))  # (timestamp, rr_interval) 형태로 저장
+        rr_window.append((timestamp, rr_interval))
 
-        if len(rr_window) == 120:  # 슬라이딩 윈도우가 꽉 찼을 때 HRV 계산
-            start_timestamp = rr_window[0][0]  # 윈도우의 첫 번째 데이터의 timestamp
-            end_timestamp = rr_window[-1][0]  # 윈도우의 마지막 데이터의 timestamp
-            
-            # 에러 데이터를 제외한 RR 간격만 추출
-            rr_list = [item[1] for item in rr_window if item[1] > 0]  # RR 값이 0보다 큰 값만 추출
-            error_count = 120 - len(rr_list)  # 총 데이터 수에서 유효한 데이터 수를 뺀 값
+    # 슬라이딩 윈도우가 가득 찼을 때 HRV 계산
+    if len(rr_window) == 120:
+        start_timestamp = rr_window[0][0]
+        end_timestamp = rr_window[-1][0]
 
-            # CSV 저장에 사용할 데이터 구성
-            hrv_data = {"SDNN": None, "LF": None, "HF": None, "LF/HF": None, "SD1": None, "SD2": None}
+        # 에러 데이터를 제외한 RR 간격 추출
+        rr_list = [item[1] for item in rr_window if item[1] > 0]
+        error_count = 120 - len(rr_list)
 
-            # 에러가 36회 이상이면 HRV 계산을 건너뜀
-            if error_count >= 36:
-                print(f"Too many errors ({error_count} errors). Skipping HRV calculation for window {start_timestamp} to {end_timestamp}.")
-            else:
-                # HRV 계산
-                time_domain_hrv = calculate_time_domain_hrv(rr_list)
-                frequency_domain_hrv = calculate_frequency_domain_hrv(rr_list)
-                nonlinear_domain_hrv = calculate_nonlinear_domain_hrv(rr_list)
+        if error_count >= 120:
+            print(f"Too many errors ({error_count}). Skipping HRV calculation for window {start_timestamp} to {end_timestamp}.")
+        else:
+            print(f"Calculating HRV for window {start_timestamp} to {end_timestamp}...")
+            # HRV 계산
+            time_domain_hrv = calculate_time_domain_hrv(rr_list)
+            frequency_domain_hrv = calculate_frequency_domain_hrv(rr_list)
+            nonlinear_domain_hrv = calculate_nonlinear_domain_hrv(rr_list)
 
-                # HRV 데이터 병합
-                hrv_data = {**time_domain_hrv, **frequency_domain_hrv, **nonlinear_domain_hrv}
-                print(f"HRV Calculated: {hrv_data}")
+            hrv_data = {**time_domain_hrv, **frequency_domain_hrv, **nonlinear_domain_hrv}
+            t2_spe = calculate_hotelling_t2_spe(hrv_data)
+            hrv_data.update(t2_spe)
 
-            # CSV 저장
+            print(f"HRV Calculated: {hrv_data}")
             write_to_csv(start_timestamp, end_timestamp, error_count, len(rr_list), hrv_data)
-
-            # 슬라이딩 윈도우를 1초씩 이동
-            rr_window.popleft()
-
-        # 마지막으로 처리한 타임스탬프 업데이트
-        last_processed_timestamp = timestamp
-
-
-
 
 if __name__ == "__main__":
     while True:
