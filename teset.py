@@ -332,8 +332,72 @@ def write_to_csv(start_timestamp, end_timestamp, error_count, rr_count, hrv_data
         os.remove(CSV_FILE_PATH)
     os.rename(TEMP_CSV_FILE_PATH, CSV_FILE_PATH)
     
+    
+# CSV에서 학습된 HRV 데이터를 로드하는 함수
+def load_training_hrv_data(csv_path, limit=None):
+    """
+    학습된 HRV 데이터를 CSV에서 로드합니다.
+    Args:
+        csv_path (str): CSV 파일 경로
+        limit (int, optional): 가져올 데이터 개수 (None이면 모든 데이터를 로드)
+    Returns:
+        list: 로드된 HRV 데이터 리스트
+    """
+    if not os.path.exists(csv_path):
+        print(f"CSV 파일이 존재하지 않습니다: {csv_path}")
+        return []
+
+    training_hrv = []
+    with open(csv_path, mode='r') as file:
+        reader = csv.DictReader(file)
+        for i, row in enumerate(reader):
+            if limit is not None and i >= limit:
+                break  # 특정 개수(limit)만큼 로드한 경우 중단
+            hrv_entry = {
+                "StartTimestamp": row["StartTimestamp"],
+                "EndTimestamp": row["EndTimestamp"],
+            }
+            for col in time_domain_cols + freq_domain_cols + nonlinear_domain_cols:
+                hrv_entry[col] = float(row[col]) if row[col] else None
+            training_hrv.append(hrv_entry)
+
+    print(f"{len(training_hrv)}개의 학습 HRV 데이터를 로드했습니다.")
+    return training_hrv
+
+    
+# CSV에서 학습된 HRV 데이터를 로드하는 함수
+# def load_training_hrv_data(csv_path):
+#     """
+#     학습된 HRV 데이터를 CSV에서 로드합니다.
+#     """
+#     if not os.path.exists(csv_path):
+#         print(f"CSV 파일이 존재하지 않습니다: {csv_path}")
+#         return []
+
+#     training_hrv = []
+#     with open(csv_path, mode='r') as file:
+#         reader = csv.DictReader(file)
+#         for row in reader:
+#             hrv_entry = {
+#                 "StartTimestamp": row["StartTimestamp"],
+#                 "EndTimestamp": row["EndTimestamp"],
+#             }
+#             for col in time_domain_cols + freq_domain_cols + nonlinear_domain_cols:
+#                 hrv_entry[col] = float(row[col]) if row[col] else None
+#             training_hrv.append(hrv_entry)
+
+#     print(f"{len(training_hrv)}개의 학습 HRV 데이터를 로드했습니다.")
+#     return training_hrv
+  
 
 
+
+# 초기에 학습된 HRV 데이터를 로드
+TRAINING_CSV_PATH = "data/data_set.csv"
+training_hrv_data = load_training_hrv_data(TRAINING_CSV_PATH)
+
+
+# 업데이트된 process_hrv 함수
 def process_hrv():
     """
     새로운 데이터를 가져와 슬라이딩 윈도우 방식으로 HRV를 계산합니다.
@@ -364,11 +428,11 @@ def process_hrv():
         rr_list = [item[1] for item in rr_window if item[1] > 0]
         error_count = 120 - len(rr_list)
 
-        if error_count >= 120:
+        if error_count >= 48:
             print(f"Too many errors ({error_count}). Skipping HRV calculation for window {start_timestamp} to {end_timestamp}.")
         else:
             print(f"Calculating HRV for window {start_timestamp} to {end_timestamp}...")
-            
+
             time_feats = calculate_time_domain_features(rr_list)
             freq_feats = calculate_frequency_domain_features(rr_list)
             nonlinear_feats = calculate_nonlinear_features(rr_list)
@@ -378,8 +442,6 @@ def process_hrv():
             hrv_data.update(freq_feats)
             hrv_data.update(nonlinear_feats)
 
-
-            
             hrv_data["Time_T2"] = None
             hrv_data["Time_SPE"] = None
             hrv_data["Frequency_T2"] = None
@@ -387,20 +449,32 @@ def process_hrv():
             hrv_data["Nonlinear_T2"] = None
             hrv_data["Nonlinear_SPE"] = None
             hrv_data["Drowsy"] = None  # 졸음 여부도 나중에 결정
-            
-            
+
             hrv_history.append((start_timestamp, end_timestamp, error_count, len(rr_list), hrv_data))
 
-
-            
-            # 2분 이후부터 HRV가 매초 계산되므로, 3분 더 쌓이면 총 180개 HRV가 축적됨.
-            if len(hrv_history) >= 30:
-                # PCA 및 이상탐지 수행
-                perform_pca_and_detect_anomaly()
-            else :
+            # 학습된 HRV 데이터를 포함하여 이상탐지 수행
+            if len(hrv_history) >= 1:
+                perform_pca_and_detect_anomaly(training_hrv_data)
+            else:
                 write_to_csv(start_timestamp, end_timestamp, error_count, len(rr_list), hrv_data)
-                
-def perform_pca_and_detect_anomaly():
+
+# PCA 수행 함수
+def perform_domain_pca(domain_data):
+    if domain_data is None or domain_data.shape[0] < 2:
+        return None, None, None, None
+    
+    scaler = StandardScaler()
+    domain_data_standardized = scaler.fit_transform(domain_data)
+    
+    n_components = min(3, domain_data_standardized.shape[1])
+    pca = PCA(n_components=n_components)
+    scores = pca.fit_transform(domain_data_standardized)
+    eigenvalues = pca.explained_variance_
+    loadings = pca.components_
+    
+    return pca, eigenvalues, scores, loadings
+                  
+def perform_pca_and_detect_anomaly(training_data):
     global hrv_history
 
     # 도메인별 feature keys
@@ -410,40 +484,31 @@ def perform_pca_and_detect_anomaly():
 
     def get_valid_domain_data(feature_keys):
         valid_entries = [(st, et, ec, rc, hd) for (st, et, ec, rc, hd) in hrv_history if all(hd.get(k) is not None for k in feature_keys)]
+        for entry in training_data:
+            if all(entry.get(k) is not None for k in feature_keys):
+                valid_entries.append((entry["StartTimestamp"], entry["EndTimestamp"], None, None, entry))
         if len(valid_entries) < 2:
             return None, None
         data_matrix = np.array([[hd[k] for k in feature_keys] for (_, _, _, _, hd) in valid_entries])
         return valid_entries, data_matrix
-    
+
+    # PCA 수행 및 이상탐지 로직은 기존과 동일
     time_entries, time_data = get_valid_domain_data(time_domain_keys)
     freq_entries, freq_data = get_valid_domain_data(frequency_domain_keys)
     nonlin_entries, nonlin_data = get_valid_domain_data(nonlinear_domain_keys)
 
-
-
-    # PCA 수행 함수
-    def perform_domain_pca(domain_data):
-        if domain_data is None or domain_data.shape[0] < 2:
-            return None, None, None, None
-        
-        scaler = StandardScaler()
-        domain_data_standardized = scaler.fit_transform(domain_data)
-        
-        n_components = min(3, domain_data_standardized.shape[1])
-        pca = PCA(n_components=n_components)
-        scores = pca.fit_transform(domain_data_standardized)
-        eigenvalues = pca.explained_variance_
-        loadings = pca.components_
-        
-        return pca, eigenvalues, scores, loadings
-
-    # 도메인별 PCA 수행
+    # 도메인별 PCA 및 이상탐지 수행
     time_pca, time_eig, time_scores, time_loadings = perform_domain_pca(time_data)
     freq_pca, freq_eig, freq_scores, freq_loadings = perform_domain_pca(freq_data)
     nonlin_pca, nonlin_eig, nonlin_scores, nonlin_loadings = perform_domain_pca(nonlin_data)
 
+
+
+
+
+
     # 임계값 계산 함수
-    def calculate_limits(scores, loadings, input_data, level_confidence=0.95):
+    def calculate_limits(scores, loadings, input_data, level_confidence=0.9):
         # T² limit 계산 (기존 동일)
         k = scores.shape[1]
         n = scores.shape[0]
