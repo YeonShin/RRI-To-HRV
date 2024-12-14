@@ -33,7 +33,7 @@ TEMP_CSV_FILE_PATH = f"./result/temp_drowsy_result_{current_time_str}.csv"
 # mean_nni, median_nni, range_nni, sdnn, sdsd, rmssd, nni_50, pnni_50, nni_20, pnni_20, cvsd, cvnni, mean_hr, min_hr, max_hr, std_hr
 time_domain_cols = [
     "mean_nni", "median_nni", "range_nni", "sdnn", "sdsd", "rmssd",
-    "nni_50", "pnni_50", "nni_20", "pnni_20", "cvsd", "cvnni",
+     "cvsd", "cvnni",
     "mean_hr", "min_hr", "max_hr", "std_hr"
 ]
 
@@ -333,7 +333,6 @@ def write_to_csv(start_timestamp, end_timestamp, error_count, rr_count, hrv_data
     os.rename(TEMP_CSV_FILE_PATH, CSV_FILE_PATH)
     
     
-# CSV에서 학습된 HRV 데이터를 로드하는 함수
 def load_training_hrv_data(csv_path, limit=None):
     """
     학습된 HRV 데이터를 CSV에서 로드합니다.
@@ -341,55 +340,34 @@ def load_training_hrv_data(csv_path, limit=None):
         csv_path (str): CSV 파일 경로
         limit (int, optional): 가져올 데이터 개수 (None이면 모든 데이터를 로드)
     Returns:
-        list: 로드된 HRV 데이터 리스트
+        list: 유의미한 HRV 데이터를 포함한 리스트
     """
     if not os.path.exists(csv_path):
         print(f"CSV 파일이 존재하지 않습니다: {csv_path}")
         return []
 
+    meaningful_cols = time_domain_cols + freq_domain_cols + nonlinear_domain_cols
     training_hrv = []
+    
     with open(csv_path, mode='r') as file:
         reader = csv.DictReader(file)
         for i, row in enumerate(reader):
             if limit is not None and i >= limit:
-                break  # 특정 개수(limit)만큼 로드한 경우 중단
+                break
+            
+            # 필요한 키들 포함
             hrv_entry = {
                 "StartTimestamp": row["StartTimestamp"],
-                "EndTimestamp": row["EndTimestamp"],
+                "EndTimestamp": row["EndTimestamp"]
             }
-            for col in time_domain_cols + freq_domain_cols + nonlinear_domain_cols:
+            
+            for col in meaningful_cols:
                 hrv_entry[col] = float(row[col]) if row[col] else None
+            
             training_hrv.append(hrv_entry)
 
     print(f"{len(training_hrv)}개의 학습 HRV 데이터를 로드했습니다.")
     return training_hrv
-
-    
-# CSV에서 학습된 HRV 데이터를 로드하는 함수
-# def load_training_hrv_data(csv_path):
-#     """
-#     학습된 HRV 데이터를 CSV에서 로드합니다.
-#     """
-#     if not os.path.exists(csv_path):
-#         print(f"CSV 파일이 존재하지 않습니다: {csv_path}")
-#         return []
-
-#     training_hrv = []
-#     with open(csv_path, mode='r') as file:
-#         reader = csv.DictReader(file)
-#         for row in reader:
-#             hrv_entry = {
-#                 "StartTimestamp": row["StartTimestamp"],
-#                 "EndTimestamp": row["EndTimestamp"],
-#             }
-#             for col in time_domain_cols + freq_domain_cols + nonlinear_domain_cols:
-#                 hrv_entry[col] = float(row[col]) if row[col] else None
-#             training_hrv.append(hrv_entry)
-
-#     print(f"{len(training_hrv)}개의 학습 HRV 데이터를 로드했습니다.")
-#     return training_hrv
-  
-
 
 
 # 초기에 학습된 HRV 데이터를 로드
@@ -502,11 +480,6 @@ def perform_pca_and_detect_anomaly(training_data):
     freq_pca, freq_eig, freq_scores, freq_loadings = perform_domain_pca(freq_data)
     nonlin_pca, nonlin_eig, nonlin_scores, nonlin_loadings = perform_domain_pca(nonlin_data)
 
-
-
-
-
-
     # 임계값 계산 함수
     def calculate_limits(scores, loadings, input_data, level_confidence=0.9):
         # T² limit 계산 (기존 동일)
@@ -602,11 +575,44 @@ def perform_pca_and_detect_anomaly(training_data):
     print("Explained Variance Ratio (Frequency Domain):", freq_pca.explained_variance_ratio_)
     print("Explained Variance Ratio (Nonlinear Domain):", nonlin_pca.explained_variance_ratio_)
 
+def save_drowsy_result(drowsy, current_hr, current_rr_size):
+    """
+    졸음 여부와 현재 HR(심박수)을 텍스트 파일에 저장합니다.
+    """
+    with open("drowsy_result.txt", "w") as file:
+        file.write(f"{drowsy}\n")
+        file.write(f"{current_hr:.2f}\n")
+        file.write(f"{current_rr_size}\n")
 
 
 
 if __name__ == "__main__":
     while True:
+        # HRV 데이터 처리
         process_hrv()
+
+        # 현재 RR Interval을 HR로 변환
+        current_rr_interval = rr_window[-1][1] if rr_window else None
+        if current_rr_interval and current_rr_interval > 0:
+            # 현재 RR Interval이 유효한 경우 HR 계산
+            current_hr = 60000.0 / current_rr_interval
+        else:
+            # RR 데이터가 없거나 유효하지 않은 경우
+            current_hr = 0
+            
+        # RR 간격 크기 계산
+        rr_size = len(rr_window)
+
+        # 졸음 상태 (HRV 결과가 없으면 초기값 1 사용)
+        if hrv_history:
+            last_hrv_entry = hrv_history[-1][4]  # 마지막 HRV 데이터
+            drowsy = last_hrv_entry.get("Drowsy", 1)  # 기본값: 졸음 상태로 판단
+        else:
+            drowsy = 1  # 초기 상태에서 졸음 상태로 판단
+
+        # 결과 저장
+        save_drowsy_result(drowsy, current_hr, rr_size)
+
+        print(f"Drowsy: {drowsy}, Current HR: {current_hr:.2f}, RR Size: {rr_size}")
         print("Waiting for the next interval...")
         time.sleep(1)
